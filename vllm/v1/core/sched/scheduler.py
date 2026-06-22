@@ -1684,6 +1684,7 @@ class Scheduler(SchedulerInterface):
                 or pooler_output is not None
                 or kv_transfer_params
                 or stopped
+                or request.events
             ):
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
