@@ -511,45 +511,46 @@ def _compiled_sample_step(
     sampled.zero_()
     num_sampled.zero_()
 
-    is_commit = is_encoder_phase[decode_slots]  # [num_decode]
+    is_commit = is_encoder_phase[decode_slots]
     is_denoise = ~is_commit
     cur_step = step_tensor[decode_slots].float()
 
-    # Step update: +1 for denoise, reset to 0 for commit
-    new_step_val = torch.where(
+    step_tensor[decode_slots] = torch.where(
         is_denoise,
         (cur_step + 1).to(step_tensor.dtype),
         step_tensor.new_zeros(num_decode),
     )
-    step_tensor[decode_slots] = new_step_val
 
-    # History length: increment for denoise, reset for commit
-    hist_len = history_len_tensor[decode_slots]
-    new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
-    history_len_tensor[decode_slots] = new_hist_len
+    # FAST ARGMAX inside compiled region
+    scaled = logits.reshape(num_decode, CL, -1).float()
+    argmax_tokens = scaled.argmax(dim=-1)
 
-    # Sampled output: commit → emit argmax_canvas, denoise → 0 (pre-zeroed)
+    argmax_canvas[decode_slots] = torch.where(
+        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
+    )
+
+    random_tokens = torch.randint(
+        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
+    )
+    canvas[decode_slots] = torch.where(
+        is_commit.unsqueeze(1), random_tokens, argmax_tokens
+    )
+
     sampled[decode_idx] = argmax_canvas[decode_slots].to(
         sampled.dtype
     ) * is_commit.unsqueeze(1).to(sampled.dtype)
-    # Commit only the real canvas length (== CL except for a canvas truncated
-    # near max_model_len); the padded tail positions are never emitted.
     num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
         num_sampled.dtype
     )
 
-    step_after = step_tensor[decode_slots]
-    converged = step_after >= max_denoising_steps
-
-    # Commit done → denoise next (False); denoise converged → commit next (True)
+    converged = step_tensor[decode_slots] >= max_denoising_steps
     is_encoder_phase[decode_slots] = torch.where(
         is_commit, is_commit.new_zeros(num_decode), converged
     )
 
-    # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
-    return logits.reshape(num_decode, CL, -1).float()
+    return scaled
 
 
 class DiffusionGemmaRequestStates:
@@ -1179,43 +1180,38 @@ class DiffusionSampler:
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
 
-        # Proper Ablation: Bypass sampling to avoid Gumbel overhead, but MUST update canvas
-        # to prevent random noise from destroying MoE expert locality.
-        is_commit = states.is_encoder_phase[decode_slots]
-        is_denoise = ~is_commit
-        states.step[decode_slots] = torch.where(
-            is_denoise,
-            states.step[decode_slots] + 1,
-            states.step.new_zeros(num_decode),
+        # --- Single compiled call: temp → sample → probs → post-process ---
+        scaled = _compiled_sample_step(
+            logits,
+            decode_slots,
+            decode_idx,
+            all_slots,
+            valid_canvas_len,
+            # State
+            states.canvas,
+            states.argmax_canvas,
+            states.step,
+            states.is_encoder_phase,
+            states.confident,
+            states.self_conditioning_embeds,
+            self.embed_weight,
+            self.normalizer,
+            states.accepted_canvas_history,
+            states.accepted_canvas_history_len,
+            # Output
+            sampled,
+            num_sampled,
+            self.req_states.draft_tokens,
+            # Config
+            max_denoising_steps=float(states.max_denoising_steps),
+            t_min=self.t_min,
+            t_max=self.t_max,
+            confidence_threshold=self.confidence_threshold,
+            vocab_size=self.vocab_size,
+            CL=self.canvas_length,
+            ST=states.stability_threshold,
+            entropy_bound=self.entropy_bound,
         )
-
-        # FAST ARGMAX directly on 2D logits, avoiding massive 3D float allocations in eager mode
-        argmax_tokens = logits.argmax(dim=-1).reshape(num_decode, CL)
-
-        states.argmax_canvas[decode_slots] = torch.where(
-            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
-        )
-
-        random_tokens = torch.randint(
-            0, self.vocab_size, (num_decode, CL), device=device, dtype=states.canvas.dtype
-        )
-        states.canvas[decode_slots] = torch.where(
-            is_commit.unsqueeze(1), random_tokens, argmax_tokens
-        )
-
-        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
-            sampled.dtype
-        ) * is_commit.unsqueeze(1).to(sampled.dtype)
-        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
-            num_sampled.dtype
-        )
-
-        converged = states.step[decode_slots] >= states.max_denoising_steps
-        states.is_encoder_phase[decode_slots] = torch.where(
-            is_commit, is_commit.new_zeros(num_decode), converged
-        )
-
-        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
@@ -1230,9 +1226,8 @@ class DiffusionSampler:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
-                # Only materialize scaled float logits when logprobs are actually requested
-                scaled = logits.reshape(num_decode, CL, -1).float()
                 flat_logits = scaled.reshape(-1, scaled.shape[-1])
+                argmax_tokens = scaled.argmax(dim=-1)
                 for local_idx in just_converged.nonzero(as_tuple=True)[0]:
                     li = local_idx.item()
                     slot = decode_slots[local_idx]
