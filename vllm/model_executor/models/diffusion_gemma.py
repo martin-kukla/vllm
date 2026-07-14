@@ -511,46 +511,6 @@ def _compiled_sample_step(
     sampled.zero_()
     num_sampled.zero_()
 
-    # ---- Phase 1: Temperature schedule ----
-    steps_f = step_tensor[decode_slots].float()
-    remaining = (max_denoising_steps - steps_f).clamp(min=1.0)
-    temp = t_min + (t_max - t_min) * (remaining / max_denoising_steps)
-
-    # ---- Phase 2: Temperature scaling + Gumbel-max sampling ----
-    logits_3d = logits.reshape(num_decode, CL, -1).float()
-    scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
-
-    # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
-    u = torch.rand_like(scaled).clamp(min=1e-20)
-    gumbel = -torch.log(-torch.log(u))
-    # Zero noise when temp==0 (greedy)
-    noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
-    new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
-    argmax_tokens = (
-        scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(num_decode, CL)
-    )
-
-    # ---- Phase 3: Probs, self-conditioning, confidence ----
-    log_probs = scaled.log_softmax(dim=-1)
-    probs = log_probs.exp()
-
-    token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
-    # A canvas truncated near max_model_len is zero-padded up to CL by the
-    # caller; those padded rows are uniform (max entropy, argmax 0), so they
-    # never trigger early convergence and are stable, and only the real
-    # ``valid_canvas_len`` tokens are committed (num_sampled below).
-    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
-    confident_tensor[decode_slots] = mean_entropy < confidence_threshold
-
-    # ---- Phase 4: Entropy-bound acceptance mask ----
-    sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
-    cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
-    cummax_ent = torch.cummax(sorted_ent, dim=-1).values
-    sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
-    eb_mask = torch.zeros_like(sorted_mask)
-    eb_mask.scatter_(1, sorted_idx, sorted_mask)
-
-    # ---- Phase 5: Post-sample ----
     is_commit = is_encoder_phase[decode_slots]  # [num_decode]
     is_denoise = ~is_commit
     cur_step = step_tensor[decode_slots].float()
@@ -563,34 +523,8 @@ def _compiled_sample_step(
     )
     step_tensor[decode_slots] = new_step_val
 
-    # Random tokens for renoise / canvas reinit
-    random_tokens = torch.randint(
-        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
-    )
-
-    # Compute denoise canvas (accept/renoise)
-    denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
-
-    # Canvas: commit → random reinit, denoise → accept/renoise result
-    canvas[decode_slots] = torch.where(
-        is_commit.unsqueeze(1), random_tokens, denoise_canvas
-    )
-
-    # History: write argmax_tokens for denoise requests at circular position
-    hist_len = history_len_tensor[decode_slots]
-    write_pos = hist_len % ST
-    for i in range(ST):
-        write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
-        history[decode_slots, i] = torch.where(
-            write_here, argmax_tokens, history[decode_slots, i]
-        )
-
-    # Argmax canvas: update for denoise, preserve for commit
-    argmax_canvas[decode_slots] = torch.where(
-        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
-    )
-
     # History length: increment for denoise, reset for commit
+    hist_len = history_len_tensor[decode_slots]
     new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
     history_len_tensor[decode_slots] = new_hist_len
 
@@ -604,42 +538,18 @@ def _compiled_sample_step(
         num_sampled.dtype
     )
 
-    # ---- Phase 6: Stability + convergence ----
-    ref = history[decode_slots, 0]
-    mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
-    for h in range(1, ST):
-        mismatch = mismatch + (ref != history[decode_slots, h]).sum(dim=-1).int()
-    stable = mismatch == 0
-
     step_after = step_tensor[decode_slots]
-    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
-        step_after >= max_denoising_steps
-    )
+    converged = step_after >= max_denoising_steps
+
     # Commit done → denoise next (False); denoise converged → commit next (True)
     is_encoder_phase[decode_slots] = torch.where(
         is_commit, is_commit.new_zeros(num_decode), converged
     )
 
-    # SC soft embedding: store ``probs @ embed_weight`` (the value the next step's
-    # self-conditioning MLP consumes) only for slots that will denoise next — i.e.
-    # this step denoised AND it isn't about to commit (is_encoder_phase now False).
-    # Masking here (rather than in the consumer) lets _apply_self_conditioning read
-    # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
-    # [.., vocab] probs avoids a giant persistent buffer.
-    sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
-    soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight) * normalizer
-    sc_embeds[decode_slots] = soft_embeds * sc_keep
-
-    # Overwrite canvas with argmax for newly converged denoise requests
-    newly_converged = (converged & is_denoise).unsqueeze(1)
-    canvas[decode_slots] = torch.where(
-        newly_converged, argmax_canvas[decode_slots], canvas[decode_slots]
-    )
-
     # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
-    return scaled
+    return logits.reshape(num_decode, CL, -1)
 
 
 class DiffusionGemmaRequestStates:
@@ -951,17 +861,18 @@ class DiffusionGemmaModelState(ModelState):
             inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
 
         # Apply self-conditioning ONLY for denoising decode requests.
-        if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
-            slots_np = input_batch.idx_mapping_np[:num_reqs]
-            num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
-            is_decode_indices_np = np.where(num_logits_np > 0)[0]
-            self._apply_self_conditioning(
-                slots_np[is_decode_indices_np],
-                is_decode_indices_np,
-                input_batch.query_start_loc_np,
-                inputs_embeds,
-                states.self_conditioning_embeds,
-            )
+        # Bypassed for ablation testing:
+        # if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
+        #     slots_np = input_batch.idx_mapping_np[:num_reqs]
+        #     num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+        #     is_decode_indices_np = np.where(num_logits_np > 0)[0]
+        #     self._apply_self_conditioning(
+        #         slots_np[is_decode_indices_np],
+        #         is_decode_indices_np,
+        #         input_batch.query_start_loc_np,
+        #         inputs_embeds,
+        #         states.self_conditioning_embeds,
+        #     )
 
         return {"inputs_embeds": inputs_embeds}
 
@@ -1268,38 +1179,29 @@ class DiffusionSampler:
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
 
-        # --- Single compiled call: temp → sample → probs → post-process ---
-        scaled = _compiled_sample_step(
-            logits,
-            decode_slots,
-            decode_idx,
-            all_slots,
-            valid_canvas_len,
-            # State
-            states.canvas,
-            states.argmax_canvas,
-            states.step,
-            states.is_encoder_phase,
-            states.confident,
-            states.self_conditioning_embeds,
-            self.embed_weight,
-            self.normalizer,
-            states.accepted_canvas_history,
-            states.accepted_canvas_history_len,
-            # Output
-            sampled,
-            num_sampled,
-            self.req_states.draft_tokens,
-            # Config
-            max_denoising_steps=float(states.max_denoising_steps),
-            t_min=self.t_min,
-            t_max=self.t_max,
-            confidence_threshold=self.confidence_threshold,
-            vocab_size=self.vocab_size,
-            CL=self.canvas_length,
-            ST=states.stability_threshold,
-            entropy_bound=self.entropy_bound,
+        # Bypassed completely for ablation:
+        is_commit = states.is_encoder_phase[decode_slots]
+        is_denoise = ~is_commit
+        states.step[decode_slots] = torch.where(
+            is_denoise,
+            states.step[decode_slots] + 1,
+            states.step.new_zeros(num_decode),
         )
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        converged = states.step[decode_slots] >= states.max_denoising_steps
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+        scaled = logits.reshape(num_decode, CL, -1)
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
