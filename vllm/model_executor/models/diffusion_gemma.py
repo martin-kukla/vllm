@@ -549,7 +549,7 @@ def _compiled_sample_step(
     # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
-    return logits.reshape(num_decode, CL, -1)
+    return logits.reshape(num_decode, CL, -1).float()
 
 
 class DiffusionGemmaRequestStates:
@@ -1201,7 +1201,7 @@ class DiffusionSampler:
         )
 
         self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
-        scaled = logits.reshape(num_decode, CL, -1)
+        scaled = logits.reshape(num_decode, CL, -1).float()
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
