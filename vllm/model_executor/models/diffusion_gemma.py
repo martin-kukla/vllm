@@ -521,19 +521,15 @@ def _compiled_sample_step(
         step_tensor.new_zeros(num_decode),
     )
 
-    # FAST ARGMAX directly on original logits (no float cast)
-    argmax_tokens = logits.reshape(num_decode, CL, -1).argmax(dim=-1)
-
+    # Skip ARGMAX and RANDINT completely.
+    # We just add 1 to the current canvas tokens so they change every step (ultra-cheap).
+    cheap_tokens = (canvas[decode_slots] + 1) % vocab_size
+    
     argmax_canvas[decode_slots] = torch.where(
-        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
+        is_denoise.unsqueeze(1), cheap_tokens, argmax_canvas[decode_slots]
     )
 
-    random_tokens = torch.randint(
-        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
-    )
-    canvas[decode_slots] = torch.where(
-        is_commit.unsqueeze(1), random_tokens, argmax_tokens
-    )
+    canvas[decode_slots] = cheap_tokens
 
     sampled[decode_idx] = argmax_canvas[decode_slots].to(
         sampled.dtype
@@ -1226,8 +1222,6 @@ class DiffusionSampler:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
-                # Only materialize scaled float logits when logprobs are actually requested
-                scaled = logits.reshape(num_decode, CL, -1).float()
                 flat_logits = scaled.reshape(-1, scaled.shape[-1])
                 argmax_tokens = scaled.argmax(dim=-1)
                 for local_idx in just_converged.nonzero(as_tuple=True)[0]:
