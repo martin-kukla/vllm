@@ -521,9 +521,8 @@ def _compiled_sample_step(
         step_tensor.new_zeros(num_decode),
     )
 
-    # FAST ARGMAX inside compiled region
-    scaled = logits.reshape(num_decode, CL, -1).float()
-    argmax_tokens = scaled.argmax(dim=-1)
+    # FAST ARGMAX directly on original logits (no float cast)
+    argmax_tokens = logits.reshape(num_decode, CL, -1).argmax(dim=-1)
 
     argmax_canvas[decode_slots] = torch.where(
         is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
@@ -550,7 +549,8 @@ def _compiled_sample_step(
 
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
-    return scaled
+    # Return empty tensor to avoid materializing a massive float tensor across compile boundary
+    return torch.empty((0,), device=device, dtype=logits.dtype)
 
 
 class DiffusionGemmaRequestStates:
@@ -1226,6 +1226,8 @@ class DiffusionSampler:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
+                # Only materialize scaled float logits when logprobs are actually requested
+                scaled = logits.reshape(num_decode, CL, -1).float()
                 flat_logits = scaled.reshape(-1, scaled.shape[-1])
                 argmax_tokens = scaled.argmax(dim=-1)
                 for local_idx in just_converged.nonzero(as_tuple=True)[0]:
