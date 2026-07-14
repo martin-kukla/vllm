@@ -1697,9 +1697,31 @@ class VllmConfig:
             )
             if max_cudagraph_capture_size is None:
                 decode_query_len = 1 + self.num_speculative_tokens
-                max_cudagraph_capture_size = min(
-                    self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
-                )
+                if (
+                    self.model_config is not None
+                    and self.model_config.is_diffusion
+                ):
+                    # Diffusion models decode canvas_length tokens per
+                    # request.  The standard 512 cap is far too small for
+                    # moderate concurrency (e.g. 4 reqs × 256 tokens =
+                    # 1024 already exceeds 512).  Use the full decode
+                    # capacity so CUDA graphs cover all batch sizes.
+                    # The +1 provides headroom: the first decode step
+                    # schedules canvas_length+1 tokens per request, and
+                    # capture sizes are later rounded up to multiples of
+                    # canvas_length by adjust_cudagraph_sizes_for_spec_decode.
+                    # Without the +1, the rounded-up size may exceed the cap.
+                    max_cudagraph_capture_size = (
+                        (self.scheduler_config.max_num_seqs + 1)
+                        * decode_query_len
+                    )
+                else:
+                    max_cudagraph_capture_size = min(
+                        self.scheduler_config.max_num_seqs
+                        * decode_query_len
+                        * 2,
+                        512,
+                    )
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
