@@ -1189,8 +1189,8 @@ class DiffusionSampler:
             states.step.new_zeros(num_decode),
         )
 
-        scaled = logits.reshape(num_decode, CL, -1).float()
-        argmax_tokens = scaled.argmax(dim=-1)
+        # FAST ARGMAX directly on 2D logits, avoiding massive 3D float allocations in eager mode
+        argmax_tokens = logits.argmax(dim=-1).reshape(num_decode, CL)
 
         states.argmax_canvas[decode_slots] = torch.where(
             is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
@@ -1230,8 +1230,9 @@ class DiffusionSampler:
             converged_mask = states.is_encoder_phase[decode_slots]
             just_converged = converged_mask & ~is_committing
             if just_converged.any():
+                # Only materialize scaled float logits when logprobs are actually requested
+                scaled = logits.reshape(num_decode, CL, -1).float()
                 flat_logits = scaled.reshape(-1, scaled.shape[-1])
-                argmax_tokens = scaled.argmax(dim=-1)
                 for local_idx in just_converged.nonzero(as_tuple=True)[0]:
                     li = local_idx.item()
                     slot = decode_slots[local_idx]
