@@ -317,15 +317,27 @@ class DiffusionGemmaForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        import vllm.model_executor.models.diffusion_gemma as dg
+        dg._G_ACTIVATED_EXPERTS_LIST = []
+            
         if intermediate_tensors is not None:
             inputs_embeds = None
-        return self.model(
+            
+        out = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        
+        if hasattr(dg, "_G_ACTIVATED_EXPERTS_LIST") and dg._G_ACTIVATED_EXPERTS_LIST:
+            layer_counts = [ids.unique().numel() for ids in dg._G_ACTIVATED_EXPERTS_LIST]
+            num_tokens = input_ids.shape[0] if input_ids is not None else (inputs_embeds.shape[0] if inputs_embeds is not None else "?")
+            logger.info(f"Activated experts per layer: {layer_counts} (num_tokens={num_tokens})")
+            dg._G_ACTIVATED_EXPERTS_LIST = []
+            
+        return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)

@@ -318,6 +318,7 @@ class Gemma4MoE(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
+        self.top_k = config.top_k_experts
 
         # Per-expert output scale folded into routing weights so that
         # FusedMoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -362,6 +363,11 @@ class Gemma4MoE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        import vllm.model_executor.models.diffusion_gemma as dg
+        _, ids = torch.topk(router_logits, k=self.top_k, dim=-1)
+        if not hasattr(dg, "_G_ACTIVATED_EXPERTS_LIST"):
+            dg._G_ACTIVATED_EXPERTS_LIST = []
+        dg._G_ACTIVATED_EXPERTS_LIST.append(ids)
         return self.experts(x, router_logits)
 
 
