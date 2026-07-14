@@ -1179,13 +1179,28 @@ class DiffusionSampler:
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
 
-        # Bypassed completely for ablation:
+        # Proper Ablation: Bypass sampling to avoid Gumbel overhead, but MUST update canvas
+        # to prevent random noise from destroying MoE expert locality.
         is_commit = states.is_encoder_phase[decode_slots]
         is_denoise = ~is_commit
         states.step[decode_slots] = torch.where(
             is_denoise,
             states.step[decode_slots] + 1,
             states.step.new_zeros(num_decode),
+        )
+
+        scaled = logits.reshape(num_decode, CL, -1).float()
+        argmax_tokens = scaled.argmax(dim=-1)
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        random_tokens = torch.randint(
+            0, self.vocab_size, (num_decode, CL), device=device, dtype=states.canvas.dtype
+        )
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, argmax_tokens
         )
 
         sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
@@ -1201,7 +1216,6 @@ class DiffusionSampler:
         )
 
         self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
-        scaled = logits.reshape(num_decode, CL, -1).float()
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
